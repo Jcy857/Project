@@ -1,0 +1,214 @@
+# Install the required packages
+```{r}
+library("ggplot2")
+library("dplyr")
+library("quantmod")
+library("rvest")
+library("readr")
+library("stringr")
+library("tidyverse")
+library("reticulate")
+```
+
+# Set the working directory to the project root
+```{r}
+project_dir <- this.path::here()
+setwd(project_dir)
+# Use the virtual environment created with Python 3.12 and PyTorch
+use_virtualenv(file.path(project_dir, ".venv"), required = TRUE)
+py_config()
+getwd()
+```
+
+# Get all tickers from the S&P 500 index
+```{r}
+tickers <- read_html(
+  "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+) |>
+  html_table() |>
+  _[[1]] |>
+  select(Symbol) |>
+  pull()
+head(tickers)
+```
+
+# Get the stock data from Yahoo Finance for all the tickers and save it to a cache folder
+```{r, results='hide', message=FALSE}
+pb <- txtProgressBar(min = 0, max = length(tickers), style = 3)
+for (ticker in tickers) {
+  setTxtProgressBar(pb, which(ticker == tickers))
+  # Replace dots with dashes for Yahoo Finance compatibility
+  ticker <- str_replace_all(ticker, "\\.", "-")
+  tryCatch({
+    dir.create("cache", showWarnings = FALSE)
+    if (file.exists(paste0("cache/", ticker, ".csv"))) {
+      next
+    }
+    df <- loadSymbols(
+                      Symbols = ticker,
+                      from = "2020-01-01",
+                      to = "2026-03-31",
+                      auto.assign = FALSE) |>
+      as.data.frame() |>
+      rownames_to_column(var = "Date") |>
+      select(Date, ends_with("Close"))
+    write_csv(df, paste0("cache/", ticker, ".csv"))
+  }, error = function(e) {
+    message(
+      paste("Error occurred while loading data for", ticker, ": ", e$message)
+    )
+  })
+}
+close(pb)
+```
+
+# Combine all the close prices into a single data frame for train set from 2020-01-01 to 2025-12-31 and save it as train.csv for faster loading in the future
+```{r}
+close_data <- data.frame(Date = as.Date(character()))
+
+# Cache the combined close data for faster loading in the future
+if (file.exists(paste0("train.csv"))) {
+  close_data <- read_csv("train.csv")
+} else {
+  for (ticker in tickers) {
+    ticker <- str_replace_all(ticker, "\\.", "-")
+    df <- read_csv(paste0("cache/", ticker, ".csv"), show_col_types = FALSE)
+    close_data <- full_join(close_data, df, by = "Date")
+    close_data <- close_data[
+                             close_data$Date >= as.Date(
+                               "2020-01-01"
+                             ) & close_data$Date <= as.Date(
+                               "2025-12-31"
+                             ), ]
+  }
+  write_csv(close_data, "train.csv")
+}
+close_data[is.na(close_data)] <- 0
+head(close_data)
+```
+
+# Combine all the close prices into a single data frame for test set from 2026-01-01 to 2026-03-31 and save it as test.csv for faster loading in the future
+```{r}
+close_data <- data.frame(Date = as.Date(character()))
+
+# Cache the combined close data for faster loading in the future
+if (file.exists(paste0("test.csv"))) {
+  close_data <- read_csv("test.csv")
+} else {
+  for (ticker in tickers) {
+    ticker <- str_replace_all(ticker, "\\.", "-")
+    df <- read_csv(paste0("cache/", ticker, ".csv"), show_col_types = FALSE)
+    close_data <- full_join(close_data, df, by = "Date")
+    close_data <- close_data[
+                             close_data$Date >= as.Date(
+                               "2026-01-01"
+                             ) & close_data$Date <= as.Date(
+                               "2026-03-31"
+                             ), ]
+  }
+  write_csv(close_data, "test.csv")
+}
+close_data[is.na(close_data)] <- 0
+head(close_data)
+```
+
+# Get the weights of the S&P 500 companies from the Slickcharts website
+```{r}
+weights <- read_html("https://www.slickcharts.com/sp500") |>
+  html_table() |>
+  _[[1]] |>
+  select(Symbol, Weight) |>
+  mutate(
+    Symbol = str_replace_all(Symbol, "\\.", "-"),
+    Weight = as.numeric(str_replace_all(Weight, "%", "")) / 100
+  )
+head(weights)
+```
+
+# Calculate the weighted close price for each company and sum them to get the S&P 500 index value
+```{r}
+weighted_close_data <- close_data |>
+  pivot_longer(-Date, names_to = "Symbol", values_to = "Close") |>
+  mutate(Symbol = str_replace_all(Symbol, "\\.Close", "")) |>
+  left_join(weights, by = "Symbol") |>
+  mutate(Weighted_Close = Close * Weight) |>
+  group_by(Date) |>
+  summarise(SP500 = sum(Weighted_Close, na.rm = TRUE))
+print(weighted_close_data)
+```
+
+# Plot the S&P 500 index value over time and compare it with VOO
+```{r, fig.height = 4, fig.width = 10}
+voo <- loadSymbols(
+  Symbols = "VOO",
+  from = "2020-01-01",
+  to = "2025-12-31",
+  auto.assign = FALSE
+) |>
+  as.data.frame() |>
+  rownames_to_column("Date") |>
+  mutate(Date = as.Date(Date)) |>
+  rename(VOO_Close = voo.Close)
+
+qqq <- loadSymbols(
+  Symbols = "QQQ",
+  from = "2020-01-01",
+  to = "2025-12-31",
+  auto.assign = FALSE
+) |>
+  as.data.frame() |>
+  rownames_to_column("Date") |>
+  mutate(Date = as.Date(Date)) |>
+  rename(QQQ_Close = qqq.Close)
+
+weighted_close_data <- weighted_close_data |>
+  mutate(Date = as.Date(Date))
+
+plot_data <- left_join(weighted_close_data, VOO, by = "Date") |>
+  left_join(QQQ, by = "Date") |>
+  pivot_longer(cols = c(SP500, VOO_Close, QQQ_Close),
+               names_to = "Index", values_to = "Value") |>
+  group_by(Index) |>
+  mutate(Rebased_Value = Value / first(Value)) |>
+  ungroup()
+
+ggplot(plot_data, aes(x = Date, y = Rebased_Value, color = Index)) +
+  geom_line() +
+  labs(title = "S&P 500 Index vs VOO (Rebased to 1)",
+       x = "Date",
+       y = "Rebased Value") +
+  theme_minimal()
+```
+
+```{python}
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+
+# Define the same model architecture
+class Net(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(Net, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        return self.fc2(self.relu(self.fc1(x)))
+
+# Reload the trained model
+close_data = pd.read_csv("train.csv", parse_dates=["Date"])
+X = close_data.drop(columns=["Date"]).values.astype("float32")
+X = np.nan_to_num(X)
+X_tensor = torch.tensor(X, dtype=torch.float32)
+
+model = Net(input_dim=X_tensor.shape[1], hidden_dim=32, output_dim=1)
+model.load_state_dict(torch.load("test_model.pt"))
+model.eval()
+
+# Make predictions
+with torch.no_grad():
+    preds = model(X_tensor)
+print(preds[:5])
+```
